@@ -180,9 +180,13 @@ function load(){
   try{S=JSON.parse(localStorage.getItem(KEY))}catch(e){S=null}
   if(!S||S.v!==1)S=fresh();
 }
-function save(){try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){toast("Couldn't save on this device")}}
+function save(){
+  try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){toast("Couldn't save on this device")}
+  pushSync();
+}
 function kid(id){return S.kids.find(k=>k.id===id)}
-function addLog(k,amt,what){k.log.unshift({t:Date.now(),amt:r2(amt),what});if(k.log.length>300)k.log.length=300}
+let lastT=0;
+function addLog(k,amt,what){const t=Math.max(Date.now(),lastT+1);lastT=t;k.log.unshift({t,amt:r2(amt),what})}
 function doneOn(k,day){return k.done[day]||[]}
 function isDone(k,choreId,day=dayKey()){return doneOn(k,day).includes(choreId)}
 function streak(k){
@@ -198,6 +202,146 @@ function totalStars(k){return Object.values(k.done).reduce((a,v)=>a+v.length,0)}
 function allowanceDue(k){return k.allowance>0&&k.allowancePaidWeek!==dayKey(weekStart())}
 function pastPenaltyTime(){const [h,m]=S.penaltyTime.split(":").map(Number);const n=new Date();return n.getHours()*60+n.getMinutes()>=h*60+m}
 
+/* ---------- family sync (optional) ----------
+   Off until a parent turns it on in Parent > Settings > Family sync.
+   When on, every change is turned into small field-level edits (syncOps) so two
+   devices changing different things at the same time never overwrite each other:
+   money uses increments, check-offs and history add or remove single entries.
+   Data still lives in localStorage too, so the app opens instantly and offline. */
+const SYNC_KEY="cheerchores.sync";
+const FAMILY_FIELDS=["v","pinHash","chores","rewards","penalty","penaltyTime","created"];
+let SY=null; /* {cfg:{apiKey,projectId,appId},fid} when this device belongs to a family */
+const SYNC={mod:null,h:null,unsub:null,ready:false,base:null,state:"off",err:"",pending:false};
+const clone=o=>JSON.parse(JSON.stringify(o));
+function loadSyncCfg(){try{SY=JSON.parse(localStorage.getItem(SYNC_KEY))}catch(e){SY=null}if(!SY||!SY.fid||!SY.cfg)SY=null}
+function storeSyncCfg(){try{SY?localStorage.setItem(SYNC_KEY,JSON.stringify(SY)):localStorage.removeItem(SYNC_KEY)}catch(e){}}
+function loadSyncModule(){return window.__ccSyncModule?Promise.resolve(window.__ccSyncModule):import("./sync.js")}
+function newFid(){const a="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",b=new Uint8Array(32);crypto.getRandomValues(b);return [...b].map(x=>a[x%62]).join("")}
+function b64u(s){return btoa(unescape(encodeURIComponent(s))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
+function unb64u(s){s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";return decodeURIComponent(escape(atob(s)))}
+function joinCode(){return "CC1."+b64u(JSON.stringify({k:SY.cfg.apiKey,p:SY.cfg.projectId,a:SY.cfg.appId,f:SY.fid}))}
+/* Accepts a family join code, or the firebaseConfig block copied from the Firebase console. */
+function parseSyncInput(txt){
+  txt=String(txt||"").trim();
+  const m=txt.match(/CC1\.([A-Za-z0-9_-]+)/);
+  if(m){try{const j=JSON.parse(unb64u(m[1]));if(j.k&&j.p&&j.a&&/^[A-Za-z0-9]{24,64}$/.test(j.f))return {join:true,cfg:{apiKey:j.k,projectId:j.p,appId:j.a},fid:j.f}}catch(e){}return null}
+  const cfg={};for(const f of ["apiKey","projectId","appId"]){const r=txt.match(new RegExp(f+`["']?\\s*:\\s*["']([^"']+)["']`));if(r)cfg[f]=r[1].trim()}
+  return cfg.apiKey&&cfg.projectId&&cfg.appId?{join:false,cfg}:null;
+}
+function familyDoc(s){const f={};for(const k of FAMILY_FIELDS)if(s[k]!==undefined)f[k]=s[k];f.kidOrder=s.kids.map(k=>k.id);return f}
+function kidData(k){const d=clone(k);delete d.id;return d}
+/* What changed between two states, as Firestore edits. */
+function syncOps(a,b){
+  const J=JSON.stringify,ops={family:{},kidsSet:[],kidsDel:[],kidsUpd:[]};
+  for(const f of FAMILY_FIELDS)if(J(a[f])!==J(b[f]))ops.family[f]=b[f]===undefined?null:b[f];
+  const bo=b.kids.map(k=>k.id);if(J(a.kids.map(k=>k.id))!==J(bo))ops.family.kidOrder=bo;
+  const am=new Map(a.kids.map(k=>[k.id,k])),bm=new Map(b.kids.map(k=>[k.id,k]));
+  const lk=l=>l.t+"|"+l.what+"|"+l.amt;
+  for(const k of b.kids){
+    const o=am.get(k.id);if(!o){ops.kidsSet.push(clone(k));continue}
+    const u=[];
+    for(const f of new Set([...Object.keys(o),...Object.keys(k)])){
+      if(f==="id")continue;const x=o[f],y=k[f];if(J(x)===J(y))continue;
+      if(f==="balance"||f==="saved"){const d=r2((+y||0)-(+x||0));if(d)u.push([[f],{inc:d}])}
+      else if(f==="done"&&y){const xs=x||{};for(const day of new Set([...Object.keys(xs),...Object.keys(y)])){
+        const p=xs[day]||[],q=y[day]||[],add=q.filter(i=>!p.includes(i)),rem=p.filter(i=>!q.includes(i));
+        if(add.length&&rem.length)u.push([["done",day],{set:q}]);else if(add.length)u.push([["done",day],{union:add}]);else if(rem.length)u.push([["done",day],{remove:rem}])}}
+      else if(f==="penaltyDays"&&y){const xs=x||{};for(const day of new Set([...Object.keys(xs),...Object.keys(y)]))
+        if(J(xs[day])!==J(y[day]))u.push([["penaltyDays",day],y[day]===undefined?{del:true}:{set:y[day]}])}
+      else if(f==="log"&&y){const xk=new Set((x||[]).map(lk)),yk=new Set(y.map(lk));
+        const add=y.filter(l=>!xk.has(lk(l))),rem=(x||[]).filter(l=>!yk.has(lk(l)));
+        if(add.length&&rem.length)u.push([["log"],{set:y}]);else if(add.length)u.push([["log"],{union:add}]);else if(rem.length)u.push([["log"],{remove:rem}])}
+      else u.push([[f],y===undefined?{del:true}:{set:y}]);
+    }
+    if(u.length)ops.kidsUpd.push({id:k.id,ops:u});
+  }
+  for(const k of a.kids)if(!bm.has(k.id))ops.kidsDel.push(k.id);
+  return ops;
+}
+function opsEmpty(o){return !Object.keys(o.family).length&&!o.kidsSet.length&&!o.kidsDel.length&&!o.kidsUpd.length}
+/* Family data from the server, as the app's state. */
+function fromRemote(fam,kids){
+  const s=fresh();for(const f of FAMILY_FIELDS)if(fam[f]!==undefined)s[f]=fam[f];s.v=1;
+  const by=new Map(kids.map(k=>[k.id,k])),order=(fam.kidOrder||[]).filter(id=>by.has(id));
+  for(const k of kids)if(!order.includes(k.id))order.push(k.id);
+  s.kids=order.map((id,i)=>{const k=Object.assign({name:"Kid",allowance:0,color:COLORS[i%COLORS.length],avatar:AVATARS[i%AVATARS.length],
+    balance:0,saved:0,goals:[],done:{},log:[],allowancePaidWeek:null,penaltyDays:{}},by.get(id));
+    k.id=id;k.balance=r2(+k.balance||0);k.saved=r2(+k.saved||0);k.log=(k.log||[]).slice().sort((p,q)=>q.t-p.t);return k});
+  return s;
+}
+function pushSync(){
+  if(!SYNC.h||!SYNC.ready||!SYNC.base)return;
+  const ops=syncOps(SYNC.base,S);SYNC.base=clone(S);
+  if(opsEmpty(ops))return;
+  SYNC.mod.apply(SYNC.h,ops).catch(e=>syncStatus({error:e&&(e.code||e.message)}));
+}
+function onRemote(fam,kids){
+  if(!fam){syncStatus({error:"missing"});return}
+  S=fromRemote(fam,kids);SYNC.base=clone(S);SYNC.ready=true;
+  try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}
+  softRender();
+}
+function syncStatus(st){
+  if(st.error){SYNC.state="error";SYNC.err=st.error}
+  else{SYNC.state=st.pending?(navigator.onLine===false||st.fromCache?"offline":"saving"):st.fromCache?"offline":"synced";SYNC.err=""}
+  const p=$("#syncpill");if(p)p.outerHTML=syncPill();
+}
+function syncPill(){
+  if(!SY)return `<span id="syncpill"></span>`;
+  const t={synced:"☁️ Synced",saving:"☁️ Saving…",offline:"📴 Offline, will sync",connecting:"☁️ Connecting…",error:"⚠️ Sync problem",off:"☁️"}[SYNC.state]||"☁️";
+  return `<span id="syncpill" class="pill ${SYNC.state==="error"?"due":""}">${t}</span>`;
+}
+function syncErrText(code){
+  code=String(code||"");
+  if(/permission/i.test(code))return "Firebase said no. Check that the security rules from the setup steps are published.";
+  if(/missing/.test(code))return "This family isn't in Firebase anymore. Disconnect this device and join again.";
+  if(/not-found|failed-precondition|NOT_FOUND/i.test(code))return "Firebase has no database yet. Create the Firestore database (setup step 3).";
+  if(/timeout|unavailable|network/i.test(code))return "Couldn't reach Firebase. Check the internet connection and try again.";
+  if(/api.?key|invalid-argument/i.test(code))return "Firebase didn't accept that setup code. Copy it again from the Firebase console.";
+  return "Sync problem: "+code;
+}
+function withTimeout(p,ms){return Promise.race([p,new Promise((_,r)=>setTimeout(()=>r({code:"timeout"}),ms))])}
+async function startSync(){
+  if(!SY||SYNC.h)return;
+  SYNC.state="connecting";
+  try{
+    SYNC.mod=await loadSyncModule();
+    SYNC.h=SYNC.mod.open(SY.cfg,SY.fid,window.__ccSyncOpts||{});
+    if(S.kids.length){SYNC.base=clone(S);SYNC.ready=true}
+    SYNC.unsub=SYNC.mod.listen(SYNC.h,onRemote,syncStatus);
+  }catch(e){syncStatus({error:e&&(e.code||e.message)});render()}
+}
+async function stopSync(){
+  if(SYNC.unsub)SYNC.unsub();const {mod,h}=SYNC;
+  Object.assign(SYNC,{h:null,unsub:null,ready:false,base:null,state:"off",err:"",pending:false});
+  if(mod&&h)await mod.close(h);
+}
+/* Make this device's data the family's data and start syncing. */
+async function createFamily(cfg){
+  const fid=newFid(),mod=await loadSyncModule(),h=mod.open(cfg,fid,Object.assign({},window.__ccSyncOpts,{temp:true}));
+  try{await withTimeout(mod.upload(h,familyDoc(S),S.kids.map(k=>({id:k.id,data:kidData(k)}))),20000)}
+  catch(e){await mod.close(h);throw e}
+  await mod.close(h);
+  SY={cfg,fid};storeSyncCfg();await startSync();
+}
+/* Join an existing family; this device's data is replaced by the family's. */
+async function joinFamily(p){
+  const mod=await loadSyncModule(),h=mod.open(p.cfg,p.fid,Object.assign({},window.__ccSyncOpts,{temp:true}));
+  let ok;try{ok=await withTimeout(mod.exists(h),20000)}finally{await mod.close(h)}
+  if(!ok)throw {code:"missing"};
+  await stopSync();SY={cfg:p.cfg,fid:p.fid};storeSyncCfg();
+  S=fresh();S.kids=[];try{localStorage.setItem(KEY,JSON.stringify(S))}catch(e){}
+  V={screen:"home",kidId:null,tab:"chores",parent:false,ptab:"today"};
+  await startSync();
+}
+/* Re-render for remote changes, but never under someone's fingers. */
+function softRender(){
+  const a=document.activeElement;
+  if(modal||(a&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))){SYNC.pending=true;const p=$("#syncpill");if(p)p.outerHTML=syncPill();return}
+  render();
+}
+document.addEventListener("focusout",()=>setTimeout(()=>{const a=document.activeElement;if(SYNC.pending&&!modal&&!(a&&/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)))render()},0));
+
 /* ---------- view state ---------- */
 let V={screen:"home",kidId:null,tab:"chores",parent:false,ptab:"today"};
 let modal=null;
@@ -205,8 +349,9 @@ function go(p){Object.assign(V,p);render();window.scrollTo(0,0)}
 
 /* ---------- rendering ---------- */
 function render(){
-  const app=$("#app");
-  if(!S.kids.length){app.innerHTML=setupView();bindSetup();return}
+  const app=$("#app");SYNC.pending=false;
+  if(SY&&!S.kids.length){app.innerHTML=connectingView();renderModal();return}
+  if(!S.kids.length){app.innerHTML=setupView();bindSetup();renderModal();return}
   if(V.screen==="kid"&&kid(V.kidId))app.innerHTML=kidView(kid(V.kidId));
   else if(V.screen==="parent"&&V.parent)app.innerHTML=parentView();
   else{V.screen="home";app.innerHTML=homeView()}
@@ -222,11 +367,13 @@ function renderModal(){
   modal.bind&&modal.bind(m);
 }
 function openModal(o){modal=o;renderModal()}
-function closeModal(){modal=null;renderModal()}
+function closeModal(){modal=null;renderModal();if(SYNC.pending)render()}
 
 function setupView(){
   return `<div class="card hero"><div class="big">📣✨</div><h1>Welcome to Cheer &amp; Chores!</h1>
-  <p class="muted">Add your cheer squad. Names stay on this iPad only.</p>
+  <p class="muted">Add your cheer squad.</p>
+  <button class="btn ghost" style="width:100%;margin:6px 0 4px" data-act="joinPrompt">🔗 Join my family (I have a family code)</button>
+  <p class="muted" style="font-size:13px;margin:4px 0 0">Already set up on another device? Join instead, and this device shares the same scores.</p>
   <div id="setupKids" class="list" style="text-align:left;margin:16px 0"></div>
   <button class="btn ghost" data-act="addSetupKid">+ Add another kid</button>
   <div class="field" style="text-align:left;margin-top:20px"><label>Parent PIN (4 digits) — locks the Parent Dashboard</label>
@@ -243,12 +390,22 @@ function bindSetup(){
   box.querySelectorAll("[data-rm]").forEach(b=>b.onclick=()=>{setupRows.splice(+b.dataset.rm,1);bindSetup()});
 }
 
-function kidCard(k){
+function connectingView(){
+  return `<div class="card hero"><div class="big">☁️</div><h1>Joining your family…</h1>
+    <p class="muted">${SYNC.state==="error"?esc(syncErrText(SYNC.err)):"Getting everyone's chores and scores. This needs the internet the first time."}</p>
+    <button class="btn ghost" data-act="syncOff">Cancel</button></div>`;
+}
+/* the kid(s) with the most stars this week, when there's someone to race */
+function leaders(){
+  if(S.kids.length<2)return [];const st=S.kids.map(starsThisWeek),m=Math.max(...st);
+  return m>0?S.kids.filter((k,i)=>st[i]===m).map(k=>k.id):[];
+}
+function kidCard(k,lead){
   const today=doneOn(k,dayKey()).length,total=S.chores.length,pct=total?Math.round(today/total*100):0,st=streak(k);
   return `<button class="card kid" data-act="openKid" data-id="${k.id}">
     <div class="stripe" style="background:${k.color}"></div>
     <div class="row" style="margin-top:6px"><div class="avatar" style="background:${k.color}22">${k.avatar}</div>
-      <div style="flex:1"><h2>${esc(k.name)}</h2><div class="muted">${today} of ${total} chores today${st?` · <span class="streak">🔥 ${st}-day streak</span>`:""}</div></div>
+      <div style="flex:1"><h2>${esc(k.name)}${lead.includes(k.id)?` <span class="pill" title="Most stars this week">👑 Leading this week</span>`:""}</h2><div class="muted">${today} of ${total} chores today${st?` · <span class="streak">🔥 ${st}-day streak</span>`:""}</div></div>
       <div style="text-align:right"><div class="money">${money(k.balance)}</div><div class="muted" style="font-size:13px">to spend</div></div></div>
     <div class="bar" style="margin-top:14px"><i style="width:${pct}%"></i></div>
     <div class="chips" style="margin-top:12px"><span class="chip">⭐ ${starsThisWeek(k)} stars this week</span><span class="chip">🐷 ${money(k.saved)} saved</span></div>
@@ -256,9 +413,10 @@ function kidCard(k){
 }
 function homeView(){
   const d=new Date();
-  return `<div class="top"><h1>📣 Cheer &amp; Chores<small>${d.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"})}</small></h1>
+  const lead=leaders();
+  return `<div class="top"><h1>📣 Cheer &amp; Chores<small>${d.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric"})} ${syncPill()}</small></h1>
     <button class="btn ghost sm" data-act="parentLogin">👪 Parent</button></div>
-    <div class="grid g2">${S.kids.map(kidCard).join("")}</div>
+    <div class="grid g2">${S.kids.map(k=>kidCard(k,lead)).join("")}</div>
     <p class="muted" style="text-align:center;margin-top:24px;font-size:14px">Tap your name to check off chores, shop and save!</p>`;
 }
 
@@ -314,7 +472,7 @@ function statsTab(k){
 function parentView(){
   const tabs=[["today","📋 Today"],["money","💵 Money"],["settings","⚙️ Settings"]];
   let body=V.ptab==="today"?pToday():V.ptab==="money"?pMoney():pSettings();
-  return `<div class="top"><button class="btn ghost sm" data-act="home">‹ Home</button><h1>👪 Parent Dashboard<small>Locks again when you go home</small></h1></div>
+  return `<div class="top"><button class="btn ghost sm" data-act="home">‹ Home</button><h1>👪 Parent Dashboard<small>Locks again when you go home ${syncPill()}</small></h1></div>
   <div class="tabs">${tabs.map(([t,l])=>`<button class="${V.ptab===t?"on":""}" data-act="ptab" data-tab="${t}">${l}</button>`).join("")}</div>${body}`;
 }
 function pToday(){
@@ -335,7 +493,8 @@ function pMoney(){
 }
 function pSettings(){
   return `<div class="grid g2">
-  <div class="card"><h3>Kids</h3>${S.kids.map((k,i)=>`<div class="edit-row"><input class="em" data-kf="avatar" data-i="${i}" value="${esc(k.avatar)}"><input data-kf="name" data-i="${i}" value="${esc(k.name)}"><input class="num" inputmode="decimal" data-kf="allowance" data-i="${i}" value="${k.allowance}"><button class="x" data-act="delKid" data-i="${i}">✕</button></div>`).join("")}
+  ${syncCard()}
+  <div class="card"><h3>Kids</h3>${S.kids.map((k,i)=>`<div class="edit-row"><input class="em" data-kf="avatar" data-id="${k.id}" value="${esc(k.avatar)}"><input data-kf="name" data-id="${k.id}" value="${esc(k.name)}"><input class="num" inputmode="decimal" data-kf="allowance" data-id="${k.id}" value="${k.allowance}"><button class="x" data-act="delKid" data-id="${k.id}">✕</button></div>`).join("")}
     <p class="muted" style="font-size:13px">Emoji · name · weekly allowance</p><button class="btn ghost sm" data-act="addKid">+ Add kid</button></div>
   <div class="card"><h3>Chores (1 ⭐ each)</h3>${S.chores.map((c,i)=>`<div class="edit-row"><input class="em" data-cf="em" data-i="${i}" value="${esc(c.em)}"><input data-cf="nm" data-i="${i}" value="${esc(c.nm)}"><button class="x" data-act="delChore" data-i="${i}">✕</button></div>`).join("")}
     <button class="btn ghost sm" data-act="addChore">+ Add chore</button></div>
@@ -346,9 +505,20 @@ function pSettings(){
     <div class="field"><label>Missed-chore penalty</label><input id="setPenalty" inputmode="decimal" value="${S.penalty}"></div>
     <div class="field"><label>Daily check time</label><input id="setTime" type="time" value="${S.penaltyTime}"></div>
     <button class="btn ghost sm" data-act="changePin">Change parent PIN</button>
-    <h3 style="margin-top:20px">Backup</h3><p class="muted" style="font-size:14px">Everything is saved on this iPad. Make a backup now and then, or use it to copy data to another device.</p>
+    <h3 style="margin-top:20px">Backup</h3><p class="muted" style="font-size:14px">${SY?"A backup is a copy of your family's data in a file. Importing one replaces the family's data on every device.":"Everything is saved on this device. Make a backup now and then, or use it to copy data to another device."}</p>
     <div class="row2"><button class="btn sm" data-act="export">⬇︎ Export backup</button><button class="btn ghost sm" data-act="import">⬆︎ Import backup</button></div>
-    <button class="btn red sm" style="margin-top:16px" data-act="resetAll">Erase everything</button></div></div>`;
+    <button class="btn red sm" style="margin-top:16px" data-act="resetAll">${SY?"Erase this device":"Erase everything"}</button></div></div>`;
+}
+function syncCard(){
+  if(SY)return `<div class="card"><h3>☁️ Family sync ${syncPill()}</h3>
+    <p class="muted" style="font-size:14px">This device shares one set of chores, money and scores with your family's other devices. Changes show up everywhere in a few seconds, and changes made offline sync when the internet is back.</p>
+    ${SYNC.state==="error"?`<p class="pill due" style="display:block;white-space:normal">${esc(syncErrText(SYNC.err))}</p>`:""}
+    <div class="row2"><button class="btn sm" data-act="shareJoin">🔗 Share family code</button><button class="btn ghost sm" data-act="syncOff">Disconnect this device</button></div>
+    <p class="muted" style="font-size:13px">To add a device: open the app there, tap “Join my family”, and paste this code. Only send it to your own family.</p></div>`;
+  return `<div class="card"><h3>☁️ Family sync</h3>
+    <p class="muted" style="font-size:14px">Share the same chores, money and scores on every iPad and phone, so the kids can see each other's progress and parents can run it from anywhere. One-time setup uses a free Firebase account: <a href="https://github.com/adameliaslaw/cheer-and-chores#family-sync" target="_blank" rel="noopener">setup steps</a>.</p>
+    <div class="field"><label>Paste your Firebase setup code or a family code</label><textarea id="syncCode" rows="4" placeholder="const firebaseConfig = { apiKey: ... }" style="padding:12px;border-radius:12px;border:2px solid var(--line);background:var(--card);font:14px ui-monospace,Menlo,monospace;color:var(--ink);-webkit-user-select:text;user-select:text"></textarea></div>
+    <button class="btn pink sm" data-act="syncOn">Turn on family sync</button></div>`;
 }
 
 /* ---------- PIN ---------- */
@@ -397,23 +567,25 @@ const actions={
   ptoggle(el){const k=kid(el.dataset.kid),tk=dayKey(),arr=k.done[tk]||(k.done[tk]=[]),i=arr.indexOf(el.dataset.id);
     if(i>=0)arr.splice(i,1);else arr.push(el.dataset.id);save();render()},
   buy(el){
-    const k=kid(V.kidId),cat=S.rewards.find(c=>c.id===el.dataset.cat),it=cat&&cat.items.find(i=>i.id===el.dataset.id);if(!it)return;
+    const kidId=V.kidId,k=kid(kidId),cat=S.rewards.find(c=>c.id===el.dataset.cat),it=cat&&cat.items.find(i=>i.id===el.dataset.id);if(!it||!k)return;
     openModal({html:()=>`<h2>Buy ${esc(it.nm)}?</h2><p>It costs <b>${money(it.price)}</b>. You'll have <b>${money(k.balance-it.price)}</b> left.</p>
       <div class="row2"><button class="btn ghost" data-close>Not now</button><span class="spacer"></span><button class="btn pink" data-ok>Buy it! 🎉</button></div>`,
       bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{
-        if(k.balance+1e-9<it.price){closeModal();return}k.balance=r2(k.balance-it.price);addLog(k,-it.price,"Bought "+it.nm);save();closeModal();confetti();render();toast("Show a parent to redeem it!")}}});
+        const k=kid(kidId);if(!k||k.balance+1e-9<it.price){closeModal();toast("Not enough money right now");return}
+        k.balance=r2(k.balance-it.price);addLog(k,-it.price,"Bought "+it.nm);save();closeModal();confetti();render();toast("Show a parent to redeem it!")}}});
   },
-  moveSave(el){const k=kid(V.kidId),inn=el.dataset.dir==="in";
+  moveSave(el){const kidId=V.kidId,k0=kid(kidId),inn=el.dataset.dir==="in";
     amountModal(inn?"Put money in savings":"Take money out of savings",inn?"Save it 🐷":"Take it out",a=>{
+      const k=kid(kidId);if(!k)return;if(a>(inn?k.balance:k.saved)+1e-9){toast("That's more than "+money(inn?k.balance:k.saved));return}
       if(inn){k.balance=r2(k.balance-a);k.saved=r2(k.saved+a);k.maxSaved=Math.max(k.maxSaved||0,k.saved);addLog(k,-a,"Moved to savings")}
       else{k.saved=r2(k.saved-a);k.balance=r2(k.balance+a);addLog(k,a,"Took from savings")}
       const b=BADGES.filter(b=>k.saved>=b.at).pop();save();render();if(inn){confetti();if(b)toast(b.em+" "+b.nm+" saver!")}
-    },{withNote:false,max:inn?k.balance:k.saved})},
-  addGoal(){const k=kid(V.kidId);openModal({html:()=>`<h2>New savings goal</h2><div class="field"><label>What are you saving for?</label><input id="gn" placeholder="New cheer bow"></div>
+    },{withNote:false,max:inn?k0.balance:k0.saved})},
+  addGoal(){const kidId=V.kidId;openModal({html:()=>`<h2>New savings goal</h2><div class="field"><label>What are you saving for?</label><input id="gn" placeholder="New cheer bow"></div>
     <div class="field"><label>How much does it cost? ($)</label><input id="ga" inputmode="decimal" placeholder="15.00"></div>
     <div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn pink" data-ok>Add goal</button></div>`,
     bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{const nm=m.querySelector("#gn").value.trim(),amt=r2(parseFloat(m.querySelector("#ga").value));
-      if(!nm||!(amt>0)){toast("Add a name and a price");return}k.goals.push({id:uid(),nm,amt});save();closeModal();render()}}})},
+      if(!nm||!(amt>0)){toast("Add a name and a price");return}const k=kid(kidId);if(!k){closeModal();return}k.goals.push({id:uid(),nm,amt});save();closeModal();render()}}})},
   delGoal(el){const k=kid(V.kidId);k.goals=k.goals.filter(g=>g.id!==el.dataset.id);save();render()},
   parentLogin(){
     if(!S.pinHash){V.parent=true;go({screen:"parent",ptab:"today"});return}
@@ -421,28 +593,29 @@ const actions={
   },
   changePin(){pinModal("New 4-digit PIN",async e=>{S.pinHash=await sha(e);save();closeModal();toast("PIN updated")})},
   payAllowance(el){const k=kid(el.dataset.kid);if(!allowanceDue(k))return;k.balance=r2(k.balance+k.allowance);k.allowancePaidWeek=dayKey(weekStart());addLog(k,k.allowance,"Weekly allowance");save();render();toast(money(k.allowance)+" paid to "+k.name)},
-  adjust(el){const k=kid(el.dataset.kid),sign=+el.dataset.dir;
-    amountModal(sign>0?"Bonus for "+esc(k.name):"Take away from "+esc(k.name),sign>0?"Add bonus":"Take away",(a,note)=>{
-      k.balance=r2(k.balance+sign*a);addLog(k,sign*a,note||(sign>0?"Bonus":"Parent adjustment"));save();render()})},
-  undo(el){const k=kid(el.dataset.kid),l=k.log[0];if(!l)return;
+  adjust(el){const kidId=el.dataset.kid,k0=kid(kidId),sign=+el.dataset.dir;
+    amountModal(sign>0?"Bonus for "+esc(k0.name):"Take away from "+esc(k0.name),sign>0?"Add bonus":"Take away",(a,note)=>{
+      const k=kid(kidId);if(!k)return;k.balance=r2(k.balance+sign*a);addLog(k,sign*a,note||(sign>0?"Bonus":"Parent adjustment"));save();render()})},
+  undo(el){const kidId=el.dataset.kid,l=kid(kidId).log[0];if(!l)return;
     openModal({html:()=>`<h2>Undo this?</h2><p>${esc(l.what)} (${money(l.amt)})</p><div class="row2"><button class="btn ghost" data-close>Keep it</button><span class="spacer"></span><button class="btn red" data-ok>Undo</button></div>`,
       bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{
+        const k=kid(kidId);if(!k||!k.log[0]||k.log[0].t!==l.t||k.log[0].what!==l.what){closeModal();toast("That changed on another device. Try again.");return}
         k.log.shift();
         if(l.what==="Moved to savings")k.saved=r2(k.saved+l.amt);
         if(l.what==="Took from savings")k.saved=r2(k.saved+l.amt);
         if(l.what==="Weekly allowance")k.allowancePaidWeek=null;
         if(l.what.startsWith("Missed chores"))for(const d in k.penaltyDays)if(k.penaltyDays[d]===-l.amt)delete k.penaltyDays[d];
         k.balance=r2(k.balance-l.amt);save();closeModal();render()}}})},
-  penalty(el){const k=kid(el.dataset.kid),tk=dayKey(),missed=S.chores.filter(c=>!isDone(k,c.id));
+  penalty(el){const kidId=el.dataset.kid,k=kid(kidId),tk=dayKey(),missed=S.chores.filter(c=>!isDone(k,c.id));
     if(!missed.length){toast("All done today 🎉");return}const amt=r2(missed.length*S.penalty);
     openModal({html:()=>`<h2>${fmtTime(S.penaltyTime)} check for ${esc(k.name)}</h2><p>Still not done:</p><div class="chips" style="margin-bottom:12px">${missed.map(c=>`<span class="chip">${c.em} ${esc(c.nm)}</span>`).join("")}</div>
       <p>${missed.length} × ${money(S.penalty)} = <b>${money(amt)}</b></p>
       <div class="row2"><button class="btn ghost" data-close>Let them finish</button><span class="spacer"></span><button class="btn red" data-ok>Apply penalty</button></div>`,
       bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{
-        k.balance=r2(k.balance-amt);k.penaltyDays[tk]=amt;addLog(k,-amt,`Missed chores (${missed.length})`);save();closeModal();render()}}})},
+        const k2=kid(kidId);if(!k2||k2.penaltyDays[tk]){closeModal();toast("Already applied today");return}k2.balance=r2(k2.balance-amt);k2.penaltyDays[tk]=amt;addLog(k2,-amt,`Missed chores (${missed.length})`);save();closeModal();render()}}})},
   addKid(){S.kids.push(newKid("New kid",0,S.kids.length));save();render()},
-  delKid(el){const k=S.kids[+el.dataset.i];openModal({html:()=>`<h2>Remove ${esc(k.name)}?</h2><p>This deletes their chores, money and history on this iPad.</p><div class="row2"><button class="btn ghost" data-close>Keep</button><span class="spacer"></span><button class="btn red" data-ok>Remove</button></div>`,
-    bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{S.kids.splice(+el.dataset.i,1);save();closeModal();if(!S.kids.length)V={screen:"home",tab:"chores",parent:false,ptab:"today"};render()}}})},
+  delKid(el){const kidId=el.dataset.id,k=kid(kidId);if(!k)return;openModal({html:()=>`<h2>Remove ${esc(k.name)}?</h2><p>This deletes their chores, money and history${SY?" on every family device":" on this device"}.</p><div class="row2"><button class="btn ghost" data-close>Keep</button><span class="spacer"></span><button class="btn red" data-ok>Remove</button></div>`,
+    bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{S.kids=S.kids.filter(x=>x.id!==kidId);save();closeModal();if(!S.kids.length)V={screen:"home",tab:"chores",parent:false,ptab:"today"};render()}}})},
   addChore(){S.chores.push({id:uid(),em:"✨",nm:"New chore"});save();render()},
   delChore(el){S.chores.splice(+el.dataset.i,1);save();render()},
   addCat(){S.rewards.push({id:uid(),cat:"🎉 New category",items:[]});save();render()},
@@ -457,12 +630,43 @@ const actions={
   },
   import(){const i=document.createElement("input");i.type="file";i.accept="application/json,.json";i.onchange=async()=>{
     try{const d=JSON.parse(await i.files[0].text());if(d.v!==1||!Array.isArray(d.kids))throw 0;
-      openModal({html:()=>`<h2>Replace everything?</h2><p>This backup has ${d.kids.length} kid(s). It replaces all data on this iPad.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Replace</button></div>`,
+      openModal({html:()=>`<h2>Replace everything?</h2><p>This backup has ${d.kids.length} kid(s). It replaces all data ${SY?"for your whole family, on every device":"on this device"}.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Replace</button></div>`,
         bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{S=d;save();closeModal();toast("Backup restored");render()}}})
     }catch(e){toast("That isn't a Cheer & Chores backup")}};i.click()},
-  resetAll(){openModal({html:()=>`<h2>Erase everything?</h2><p>All kids, money and history on this iPad will be gone. Export a backup first if you might want it.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Erase</button></div>`,
-    bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{S=fresh();setupRows=[{name:"",allowance:""}];save();closeModal();V={screen:"home",tab:"chores",parent:false,ptab:"today"};render()}}})},
+  resetAll(){openModal({html:()=>SY?`<h2>Erase this device?</h2><p>This device leaves family sync and starts fresh. Your family's data stays safe on your other devices.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Erase</button></div>`
+      :`<h2>Erase everything?</h2><p>All kids, money and history on this device will be gone. Export a backup first if you might want it.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Erase</button></div>`,
+    bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=async()=>{if(SY){await stopSync();SY=null;storeSyncCfg()}S=fresh();setupRows=[{name:"",allowance:""}];save();closeModal();V={screen:"home",tab:"chores",parent:false,ptab:"today"};render()}}})},
   addSetupKid(){setupRows.push({name:"",allowance:""});bindSetup()},
+  /* ----- family sync ----- */
+  joinPrompt(){openModal({html:()=>`<h2>Join my family</h2><p class="muted">On a device that's already set up, go to Parent › Settings › Family sync › Share family code. Then paste the code here.</p>
+    <div class="field"><label>Family code</label><textarea id="joinCode" rows="4" placeholder="CC1.…" style="padding:12px;border-radius:12px;border:2px solid var(--line);background:var(--card);font:14px ui-monospace,Menlo,monospace;color:var(--ink);-webkit-user-select:text;user-select:text"></textarea></div>
+    <div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn pink" data-ok>Join</button></div>`,
+    bind(m){m.querySelector("[data-close]").onclick=closeModal;const ok=m.querySelector("[data-ok]");ok.onclick=async()=>{
+      const p=parseSyncInput(m.querySelector("#joinCode").value);if(!p||!p.join){toast("That isn't a family code");return}
+      ok.disabled=true;ok.textContent="Joining…";
+      try{await joinFamily(p);closeModal();render();toast("Joined! 🎉")}catch(e){ok.disabled=false;ok.textContent="Join";toast(syncErrText(e&&(e.code||e.message)))}}}})},
+  async syncOn(el){
+    const p=parseSyncInput(($("#syncCode")||{}).value);
+    if(!p){toast("Paste the firebaseConfig block from Firebase, or a family code");return}
+    if(p.join){openModal({html:()=>`<h2>Join this family?</h2><p>This device's kids, money and history are replaced by the family's.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Join</button></div>`,
+      bind(m){m.querySelector("[data-close]").onclick=closeModal;const ok=m.querySelector("[data-ok]");ok.onclick=async()=>{ok.disabled=true;ok.textContent="Joining…";
+        try{await joinFamily(p);closeModal();render();toast("Joined! 🎉")}catch(e){closeModal();toast(syncErrText(e&&(e.code||e.message)))}}}});return}
+    el.disabled=true;el.textContent="Setting up…";
+    try{await createFamily(p.cfg);render();toast("Family sync is on ☁️");actions.shareJoin()}
+    catch(e){el.disabled=false;el.textContent="Turn on family sync";toast(syncErrText(e&&(e.code||e.message)))}
+  },
+  async shareJoin(){
+    if(!SY)return;const code=joinCode();
+    openModal({html:()=>`<h2>Your family code</h2><p class="muted">On each iPad or phone: open Cheer &amp; Chores from its home-screen icon, tap “Join my family”, and paste this. Only share it with your own family.</p>
+      <textarea readonly rows="5" style="width:100%;padding:12px;border-radius:12px;border:2px solid var(--line);background:var(--bg);font:13px ui-monospace,Menlo,monospace;color:var(--ink);-webkit-user-select:all;user-select:all">${esc(code)}</textarea>
+      <div class="row2" style="margin-top:12px"><button class="btn ghost" data-close>Done</button><span class="spacer"></span><button class="btn" data-copy>📋 Copy</button>${navigator.share?`<button class="btn pink" data-share>Share…</button>`:""}</div>`,
+      bind(m){m.querySelector("[data-close]").onclick=closeModal;
+        m.querySelector("[data-copy]").onclick=async()=>{try{await navigator.clipboard.writeText(code);toast("Copied")}catch(e){const t=m.querySelector("textarea");t.focus();t.select();toast("Select the code and tap Copy")}};
+        const sh=m.querySelector("[data-share]");if(sh)sh.onclick=async()=>{try{await navigator.share({text:code})}catch(e){}}}})},
+  syncOff(){
+    if(!SY)return;
+    openModal({html:()=>`<h2>Disconnect this device?</h2><p>This device stops syncing and keeps its own copy. Your family's data on other devices isn't touched. You can join again with the family code.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Disconnect</button></div>`,
+      bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=async()=>{await stopSync();SY=null;storeSyncCfg();if(!S.kids.length)S=fresh();save();closeModal();V.parent=false;go({screen:"home"});toast("Disconnected")}}})},
   async finishSetup(){
     const rows=setupRows.map(r=>({name:r.name.trim(),allowance:r2(parseFloat(r.allowance)||0)})).filter(r=>r.name);
     if(!rows.length){toast("Add at least one name");return}
@@ -473,7 +677,7 @@ const actions={
 document.addEventListener("click",e=>{const el=e.target.closest("[data-act]");if(!el||!actions[el.dataset.act])return;actions[el.dataset.act](el)});
 /* settings edits save on change */
 document.addEventListener("change",e=>{const t=e.target,d=t.dataset;if(!(V.screen==="parent"&&V.parent))return;
-  if(d.kf){const k=S.kids[+d.i];k[d.kf]=d.kf==="allowance"?r2(parseFloat(t.value)||0):(t.value.trim()||k[d.kf])}
+  if(d.kf){const k=kid(d.id);if(!k)return;k[d.kf]=d.kf==="allowance"?r2(parseFloat(t.value)||0):(t.value.trim()||k[d.kf])}
   else if(d.cf){S.chores[+d.i][d.cf]=t.value.trim()||S.chores[+d.i][d.cf]}
   else if(d.catf){S.rewards[+d.ci].cat=t.value.trim()||S.rewards[+d.ci].cat}
   else if(d.itf){const it=S.rewards[+d.ci].items[+d.ii];it[d.itf]=d.itf==="price"?r2(parseFloat(t.value)||0):(t.value.trim()||it.nm)}
@@ -481,9 +685,10 @@ document.addEventListener("change",e=>{const t=e.target,d=t.dataset;if(!(V.scree
   else if(t.id==="setTime"){if(/^\d\d:\d\d$/.test(t.value))S.penaltyTime=t.value}
   else return;save();render()});
 /* refresh when the app comes back to the foreground (new day, new week) */
-document.addEventListener("visibilitychange",()=>{if(!document.hidden){load();if(V.screen==="parent")V.parent=false,V.screen="home";render()}});
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!SY)load();if(V.screen==="parent")V.parent=false,V.screen="home";render()}});
 
-load();render();
+load();loadSyncCfg();render();startSync();
+setTimeout(()=>{if(SY&&SYNC.state==="connecting")syncStatus({fromCache:true})},10000);
 if("serviceWorker" in navigator&&location.protocol==="https:")navigator.serviceWorker.register("sw.js").catch(()=>{});
 /* ask the browser to keep our data even when storage is tight */
 if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().catch(()=>{});

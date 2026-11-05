@@ -59,7 +59,7 @@ click(act("ptab",'[data-tab="settings"]'));
 const ci=$('[data-cf="nm"][data-i="0"]'); ci.value="Make Your Bed"; ci.dispatchEvent(new w.Event("change",{bubbles:true}));
 const pi=$('[data-itf="price"][data-ci="0"][data-ii="0"]'); pi.value="0.5"; pi.dispatchEvent(new w.Event("change",{bubbles:true}));
 S=st(); assert.equal(S.chores[0].nm,"Make Your Bed"); assert.equal(S.rewards[0].items[0].price,0.5); ok("edit chores and prices");
-const kn=$('[data-kf="name"][data-i="1"]'); kn.value='<img src=x onerror=alert(1)>B'; kn.dispatchEvent(new w.Event("change",{bubbles:true}));
+const kn=$(`[data-kf="name"][data-id="${st().kids[1].id}"]`); kn.value='<img src=x onerror=alert(1)>B'; kn.dispatchEvent(new w.Event("change",{bubbles:true}));
 assert(!$$("img").length,"names escaped"); ok("typed names can't inject HTML");
 // 4. kid shops and saves
 click(act("home")); if(w.document.getElementById("app").textContent.includes("Parent Dashboard")) console.log("BODY:", w.document.getElementById("app").textContent.slice(0,400), "SCREEN", w.document.querySelector(".top h1").textContent); assert(!w.document.getElementById("app").textContent.includes("Parent Dashboard"),"parent locks on home"); ok("parent mode locks on Home");

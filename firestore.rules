@@ -1,0 +1,16 @@
+rules_version = '2';
+// Cheer & Chores security rules. Paste these into the Firebase console (Firestore > Rules tab), then Publish.
+// Each family lives under families/{familyId}. The family id is a 32-character random code that
+// only your own devices know (it's inside your family code), so nobody can find, list or read
+// your family's data without it. Anything outside families/ is closed.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /families/{fid} {
+      allow get, create, update: if fid.matches('^[A-Za-z0-9]{24,64}$');
+      allow list, delete: if false;
+      match /kids/{kid} {
+        allow read, write: if fid.matches('^[A-Za-z0-9]{24,64}$');
+      }
+    }
+  }
+}
