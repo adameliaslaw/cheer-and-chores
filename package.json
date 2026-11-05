@@ -1,0 +1,7 @@
+{
+  "name": "cheer-and-chores",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node tests/app.test.mjs" },
+  "devDependencies": { "jsdom": "24.1.3" }
+}
