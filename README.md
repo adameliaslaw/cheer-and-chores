@@ -32,9 +32,21 @@ Family sync puts the family's data in a small free database (Google Firebase Clo
 
 ### Adding the other devices
 
-On each other iPad or iPhone: add the app to the home screen, open it from the icon, tap **🔗 Join my family**, and paste the family code (use **Share family code** in Parent > Settings > Family sync on a synced device to AirDrop or message it to yourself). The device downloads the family and stays in sync from then on.
+**By QR code (easiest).** On a synced phone, go to Parent > Settings > Family sync > **📱 Show join QR code**. Then on each iPad:
 
-A device that already had its own kids set up can join too: Parent > Settings > Family sync, paste the family code, tap the button, and confirm. Its old local data is replaced by the family's.
+1. Add the app to the Home Screen (Safari > Share > Add to Home Screen) if it isn't there yet.
+2. Open it from the Home Screen icon.
+3. Tap **🔗 Join my family**, then **📷 Scan QR code**, allow the camera, and hold the phone's screen in front of it.
+
+The iPad joins in one step: kids, money, scores and the parent PIN all come across, and the camera turns off.
+
+Why scan inside the app rather than with the iPad's Camera app? On iPadOS and iOS, the Home Screen app keeps its own storage, separate from Safari's. A QR scanned with the Camera app opens Safari, and joining there wouldn't reach the Home Screen app. If someone does scan with the Camera app, the page says so and explains the three steps above; it also saves the join so that if iOS copies Safari's data when the app is added to the Home Screen, the app offers the join itself on first open.
+
+The QR code holds the app's address with the family code after `#` (`…/cheer-and-chores/#join=CC1.…`). The part after `#` is never sent to any web server, and the app clears it from the address bar as soon as it reads it.
+
+**By family code.** **🔗 Share family code** (same place) shows the code to copy, AirDrop or message to yourself. On the other device: Join my family, paste it, Join.
+
+A device that already had its own kids set up can join too: Parent > Settings > Family sync, then **📷 Scan a family QR code** or paste the family code, and confirm. Its old local data is replaced by the family's.
 
 ### What syncs and how
 
@@ -64,23 +76,27 @@ The parent PIN is stored as a SHA-256 hash, not in plain text.
 | `index.html` | The whole app (HTML, CSS, JS) |
 | `sync.js` | Built Firebase sync bundle; loaded only when family sync is on |
 | `src/sync.js` | Source of `sync.js` (thin Firestore wrapper) |
+| `qr.js` | Built QR bundle (draws the join QR, reads it from the camera); loaded only when a QR is shown or scanned |
+| `src/qr.js` | Source of `qr.js` ([qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) 2.0.4, MIT; [jsQR](https://github.com/cozmo/jsQR) 1.4.0, Apache-2.0) |
 | `firestore.rules` | Security rules to paste into the Firebase console |
 | `manifest.webmanifest` | Home-screen name, colors, icons |
 | `sw.js` | Service worker for offline use |
 | `icon-*.png` | App icons |
 | `tests/app.test.mjs` | 21 app checks (jsdom) |
-| `tests/sync.test.mjs` | 24 multi-device sync checks against the Firestore emulator |
+| `tests/qr.test.mjs` | 4 QR checks: draw the join link, read it back from noisy camera-sized frames |
+| `tests/sync.test.mjs` | 32 multi-device checks against the Firestore emulator, including QR join, the in-app scanner, the Safari case, and camera blocked or missing |
 | `firebase.json` | Emulator settings for the sync tests |
 
 ## Updating
 
-Edit the files and push to `main`; GitHub Pages republishes. **Bump `VERSION` in `sw.js`** on every change so devices pick up the new version (they get it the next time the app opens online). After editing `src/sync.js`, run `npm run build` and commit the new `sync.js`.
+Edit the files and push to `main`; GitHub Pages republishes. **Bump `VERSION` in `sw.js`** on every change so devices pick up the new version (they get it the next time the app opens online). After editing `src/sync.js` or `src/qr.js`, run `npm run build` and commit the new `sync.js` and `qr.js`.
 
 ## Tests
 
 ```
 npm install
-npm test                 # app checks
+npm run build            # builds sync.js and qr.js
+npm test                 # app and QR checks
 npm run emulator         # in a second terminal; needs Java 11+
 npm run test:sync        # sync checks across three simulated devices
 ```

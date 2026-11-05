@@ -115,6 +115,12 @@ canvas#fx{position:fixed;inset:0;pointer-events:none;z-index:70}
 .pill{display:inline-block;padding:3px 9px;border-radius:99px;font-size:12px;font-weight:800;background:var(--goldbg);color:var(--goldink)}
 .pill.due{background:var(--redbg);color:var(--red)}
 h3{margin:0 0 10px}
+.qrbox{background:#fff;padding:12px;border-radius:18px;width:min(300px,78vw);margin:6px auto 10px;box-shadow:var(--shadow)}
+.qrbox svg{display:block;width:100%;height:auto}
+.scan{position:relative;background:#000;border-radius:18px;overflow:hidden;aspect-ratio:1;width:min(320px,80vw);margin:6px auto 10px}
+.scan video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.scan .frame{position:absolute;inset:15%;border:4px solid #fff;border-radius:20px;box-shadow:0 0 0 999px rgba(0,0,0,.3)}
+ol.steps{margin:6px 0 10px;padding-left:22px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -216,10 +222,17 @@ const clone=o=>JSON.parse(JSON.stringify(o));
 function loadSyncCfg(){try{SY=JSON.parse(localStorage.getItem(SYNC_KEY))}catch(e){SY=null}if(!SY||!SY.fid||!SY.cfg)SY=null}
 function storeSyncCfg(){try{SY?localStorage.setItem(SYNC_KEY,JSON.stringify(SY)):localStorage.removeItem(SYNC_KEY)}catch(e){}}
 function loadSyncModule(){return window.__ccSyncModule?Promise.resolve(window.__ccSyncModule):import("./sync.js")}
+function loadQrModule(){return window.__ccQrModule?Promise.resolve(window.__ccQrModule):import("./qr.js")}
+/* iOS keeps a home-screen app's data apart from Safari's, so a link opened in Safari can't join the home-screen app. */
+function isStandalone(){return !!(navigator.standalone||(window.matchMedia&&matchMedia("(display-mode: standalone)").matches))}
+function isIOS(){const n=navigator;return /iPad|iPhone|iPod/.test(n.userAgent||"")||(n.platform==="MacIntel"&&n.maxTouchPoints>1)}
+const PENDING_KEY="cheerchores.pendingJoin";
 function newFid(){const a="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",b=new Uint8Array(32);crypto.getRandomValues(b);return [...b].map(x=>a[x%62]).join("")}
 function b64u(s){return btoa(unescape(encodeURIComponent(s))).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
 function unb64u(s){s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";return decodeURIComponent(escape(atob(s)))}
 function joinCode(){return "CC1."+b64u(JSON.stringify({k:SY.cfg.apiKey,p:SY.cfg.projectId,a:SY.cfg.appId,f:SY.fid}))}
+/* The address in the join QR code. The family code rides in the #fragment, which browsers never send to the web server. */
+function joinUrl(){return new URL("./",location.href).href.split("#")[0]+"#join="+joinCode()}
 /* Accepts a family join code, or the firebaseConfig block copied from the Firebase console. */
 function parseSyncInput(txt){
   txt=String(txt||"").trim();
@@ -334,6 +347,44 @@ async function joinFamily(p){
   V={screen:"home",kidId:null,tab:"chores",parent:false,ptab:"today"};
   await startSync();
 }
+async function doJoin(p){
+  openModal({locked:true,html:()=>`<h2>Joining your family…</h2><p class="muted">Getting everyone's chores and scores.</p>`});
+  try{await joinFamily(p);closeModal();render();confetti();toast("Joined! 🎉")}
+  catch(e){closeModal();toast(syncErrText(e&&(e.code||e.message)))}
+}
+/* Confirm before a join replaces anything, or when it came from a link rather than a tap here. */
+function offerJoin(p,o){
+  o=o||{};
+  if(SY&&SY.fid===p.fid){toast("This device is already in your family ✅");return}
+  const hasData=!!(SY||S.kids.length);
+  if(!hasData&&!o.link){doJoin(p);return}
+  openModal({html:()=>`<h2>${hasData?"Join this family?":"Join your family?"}</h2><p>${hasData?"This device's kids, money and history are replaced by the family's.":"This device will share chores, money and scores with your family's other devices."}</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn ${hasData?"red":"pink"}" data-ok>Join</button></div>`,
+    bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=()=>{closeModal();doJoin(p)}}});
+}
+function camErrText(e){const n=e&&e.name;
+  if(n==="NotAllowedError"||n==="SecurityError")return "The camera is blocked. Close and reopen the app, tap Scan again and choose Allow. Or paste the family code instead.";
+  if(n==="NotFoundError"||n==="OverconstrainedError"||n==="NotReadableError")return "No camera is available. Paste the family code instead.";
+  return "Couldn't start the camera. Paste the family code instead."}
+/* A join link opened from the iPad's Camera app (…#join=CC1.…). */
+function handleJoinLink(){
+  const h=location.hash||"";
+  if(/^#join=/.test(h)){
+    try{history.replaceState(null,"",location.pathname+location.search)}catch(e){}
+    let code="";try{code=decodeURIComponent(h.slice(6))}catch(e){}
+    const p=parseSyncInput(code);
+    if(!p||!p.join){toast("That join link didn't come through. Show the QR code again.");return}
+    if(SY&&SY.fid===p.fid){toast("This device is already in your family ✅");return}
+    if(isIOS()&&!isStandalone()){
+      try{localStorage.setItem(PENDING_KEY,JSON.stringify({code:code.match(/CC1\.[A-Za-z0-9_-]+/)[0],t:Date.now()}))}catch(e){}
+      openModal({html:()=>`<h2>📲 Almost there</h2><p>This opened in Safari. The Cheer &amp; Chores app on the Home Screen keeps its own data, so join from there:</p>
+        <ol class="steps"><li>No icon yet? Tap the Share button, then “Add to Home Screen”.</li><li>Open Cheer &amp; Chores from its Home Screen icon.</li><li>Tap “Join my family”, then “📷 Scan QR code”, and scan the code again.</li></ol>
+        <div class="row2"><span class="spacer"></span><button class="btn pink" data-close>Got it</button></div>`,
+        bind(m){m.querySelector("[data-close]").onclick=closeModal}});
+      return}
+    offerJoin(p,{link:true});return}
+  if(isStandalone()&&!SY){let j=null;try{j=JSON.parse(localStorage.getItem(PENDING_KEY));localStorage.removeItem(PENDING_KEY)}catch(e){}
+    if(j&&Date.now()-j.t<864e5){const p=parseSyncInput(j.code);if(p&&p.join)offerJoin(p,{link:true})}}
+}
 /* Re-render for remote changes, but never under someone's fingers. */
 function softRender(){
   const a=document.activeElement;
@@ -358,7 +409,7 @@ function render(){
   renderModal();
 }
 function renderModal(){
-  let m=$("#modal");if(m)m.remove();
+  let m=$("#modal");if(m){if(m._cleanup)try{m._cleanup()}catch(e){}m.remove()}
   if(!modal)return;
   m=document.createElement("div");m.id="modal";m.className="modal";
   m.innerHTML=`<div class="card">${modal.html()}</div>`;
@@ -372,7 +423,7 @@ function closeModal(){modal=null;renderModal();if(SYNC.pending)render()}
 function setupView(){
   return `<div class="card hero"><div class="big">📣✨</div><h1>Welcome to Cheer &amp; Chores!</h1>
   <p class="muted">Add your cheer squad.</p>
-  <button class="btn ghost" style="width:100%;margin:6px 0 4px" data-act="joinPrompt">🔗 Join my family (I have a family code)</button>
+  <button class="btn ghost" style="width:100%;margin:6px 0 4px" data-act="joinPrompt">🔗 Join my family (scan or paste a family code)</button>
   <p class="muted" style="font-size:13px;margin:4px 0 0">Already set up on another device? Join instead, and this device shares the same scores.</p>
   <div id="setupKids" class="list" style="text-align:left;margin:16px 0"></div>
   <button class="btn ghost" data-act="addSetupKid">+ Add another kid</button>
@@ -513,12 +564,12 @@ function syncCard(){
   if(SY)return `<div class="card"><h3>☁️ Family sync ${syncPill()}</h3>
     <p class="muted" style="font-size:14px">This device shares one set of chores, money and scores with your family's other devices. Changes show up everywhere in a few seconds, and changes made offline sync when the internet is back.</p>
     ${SYNC.state==="error"?`<p class="pill due" style="display:block;white-space:normal">${esc(syncErrText(SYNC.err))}</p>`:""}
-    <div class="row2"><button class="btn sm" data-act="shareJoin">🔗 Share family code</button><button class="btn ghost sm" data-act="syncOff">Disconnect this device</button></div>
-    <p class="muted" style="font-size:13px">To add a device: open the app there, tap “Join my family”, and paste this code. Only send it to your own family.</p></div>`;
+    <div class="row2"><button class="btn pink sm" data-act="showJoinQR">📱 Show join QR code</button><button class="btn sm" data-act="shareJoin">🔗 Share family code</button><button class="btn ghost sm" data-act="syncOff">Disconnect this device</button></div>
+    <p class="muted" style="font-size:13px">To add an iPad: tap Show join QR code. On the iPad, open the app from its Home Screen icon, tap “Join my family”, then “Scan QR code”. Only show it to your own family.</p></div>`;
   return `<div class="card"><h3>☁️ Family sync</h3>
     <p class="muted" style="font-size:14px">Share the same chores, money and scores on every iPad and phone, so the kids can see each other's progress and parents can run it from anywhere. One-time setup uses a free Firebase account: <a href="https://github.com/adameliaslaw/cheer-and-chores#family-sync" target="_blank" rel="noopener">setup steps</a>.</p>
     <div class="field"><label>Paste your Firebase setup code or a family code</label><textarea id="syncCode" rows="4" placeholder="const firebaseConfig = { apiKey: ... }" style="padding:12px;border-radius:12px;border:2px solid var(--line);background:var(--card);font:14px ui-monospace,Menlo,monospace;color:var(--ink);-webkit-user-select:text;user-select:text"></textarea></div>
-    <button class="btn pink sm" data-act="syncOn">Turn on family sync</button></div>`;
+    <div class="row2"><button class="btn pink sm" data-act="syncOn">Turn on family sync</button><button class="btn sm" data-act="scanJoin">📷 Scan a family QR code</button></div></div>`;
 }
 
 /* ---------- PIN ---------- */
@@ -638,23 +689,54 @@ const actions={
     bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-ok]").onclick=async()=>{if(SY){await stopSync();SY=null;storeSyncCfg()}S=fresh();setupRows=[{name:"",allowance:""}];save();closeModal();V={screen:"home",tab:"chores",parent:false,ptab:"today"};render()}}})},
   addSetupKid(){setupRows.push({name:"",allowance:""});bindSetup()},
   /* ----- family sync ----- */
-  joinPrompt(){openModal({html:()=>`<h2>Join my family</h2><p class="muted">On a device that's already set up, go to Parent › Settings › Family sync › Share family code. Then paste the code here.</p>
+  joinPrompt(){openModal({html:()=>`<h2>Join my family</h2><p class="muted">On the parent phone, go to Parent › Settings › Family sync › Show join QR code. Then scan it here.</p>
+    <button class="btn pink" style="width:100%;margin:4px 0 8px" data-scan>📷 Scan QR code</button>
+    <p class="muted" style="font-size:13px;margin:8px 0 0">Or paste a family code (Share family code on the parent phone):</p>
     <div class="field"><label>Family code</label><textarea id="joinCode" rows="4" placeholder="CC1.…" style="padding:12px;border-radius:12px;border:2px solid var(--line);background:var(--card);font:14px ui-monospace,Menlo,monospace;color:var(--ink);-webkit-user-select:text;user-select:text"></textarea></div>
     <div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn pink" data-ok>Join</button></div>`,
-    bind(m){m.querySelector("[data-close]").onclick=closeModal;const ok=m.querySelector("[data-ok]");ok.onclick=async()=>{
+    bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-scan]").onclick=()=>actions.scanJoin();const ok=m.querySelector("[data-ok]");ok.onclick=()=>{
       const p=parseSyncInput(m.querySelector("#joinCode").value);if(!p||!p.join){toast("That isn't a family code");return}
-      ok.disabled=true;ok.textContent="Joining…";
-      try{await joinFamily(p);closeModal();render();toast("Joined! 🎉")}catch(e){ok.disabled=false;ok.textContent="Join";toast(syncErrText(e&&(e.code||e.message)))}}}})},
+      closeModal();offerJoin(p)}}})},
   async syncOn(el){
     const p=parseSyncInput(($("#syncCode")||{}).value);
     if(!p){toast("Paste the firebaseConfig block from Firebase, or a family code");return}
-    if(p.join){openModal({html:()=>`<h2>Join this family?</h2><p>This device's kids, money and history are replaced by the family's.</p><div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn red" data-ok>Join</button></div>`,
-      bind(m){m.querySelector("[data-close]").onclick=closeModal;const ok=m.querySelector("[data-ok]");ok.onclick=async()=>{ok.disabled=true;ok.textContent="Joining…";
-        try{await joinFamily(p);closeModal();render();toast("Joined! 🎉")}catch(e){closeModal();toast(syncErrText(e&&(e.code||e.message)))}}}});return}
+    if(p.join){offerJoin(p);return}
     el.disabled=true;el.textContent="Setting up…";
-    try{await createFamily(p.cfg);render();toast("Family sync is on ☁️");actions.shareJoin()}
+    try{await createFamily(p.cfg);render();toast("Family sync is on ☁️");actions.showJoinQR()}
     catch(e){el.disabled=false;el.textContent="Turn on family sync";toast(syncErrText(e&&(e.code||e.message)))}
   },
+  async showJoinQR(){
+    if(!SY)return;let q;
+    try{q=await loadQrModule()}catch(e){toast("Couldn't load the QR code. Check the internet and try again.");return}
+    const url=joinUrl();
+    openModal({html:()=>`<h2>📱 Add an iPad or phone</h2><div class="qrbox">${q.svg(url)}</div>
+      <ol class="steps"><li>On the iPad, open Cheer &amp; Chores from its Home Screen icon.</li><li>Tap “Join my family”, then “📷 Scan QR code”.</li><li>Hold this screen in front of the iPad's camera.</li></ol>
+      <p class="muted" style="font-size:13px">Only show this to your own family. It works for every device, so keep it open while you go around.</p>
+      <div class="row2"><button class="btn ghost sm" data-code>🔗 Family code instead</button><span class="spacer"></span><button class="btn pink" data-close>Done</button></div>`,
+      bind(m){m.querySelector("[data-close]").onclick=closeModal;m.querySelector("[data-code]").onclick=()=>actions.shareJoin()}})},
+  async scanJoin(){
+    const md=navigator.mediaDevices;
+    if(!md||!md.getUserMedia){toast("The camera isn't available here. Paste the family code instead.");actions.joinPrompt();return}
+    let q;try{q=await loadQrModule()}catch(e){toast("Couldn't load the scanner. Check the internet and try again.");return}
+    openModal({html:()=>`<h2>📷 Scan the family QR code</h2><div class="scan"><video playsinline muted autoplay></video><div class="frame"></div></div>
+      <p class="muted" id="scanMsg" style="text-align:center;font-size:14px">On the parent phone: Parent › Settings › Family sync › Show join QR code.</p>
+      <div class="row2"><button class="btn ghost" data-close>Cancel</button><span class="spacer"></span><button class="btn ghost sm" data-paste>Paste a code instead</button></div>`,
+      bind(m){
+        let stream=null,timer=0,done=false;
+        const stop=()=>{done=true;clearTimeout(timer);if(stream)stream.getTracks().forEach(t=>t.stop());stream=null};
+        m._cleanup=stop;
+        m.querySelector("[data-close]").onclick=closeModal;
+        m.querySelector("[data-paste]").onclick=()=>{closeModal();actions.joinPrompt()};
+        const v=m.querySelector("video"),msg=m.querySelector("#scanMsg"),cv=document.createElement("canvas"),cx=cv.getContext&&cv.getContext("2d",{willReadFrequently:true});
+        const tick=()=>{if(done)return;
+          try{if(cx&&v.readyState>=2&&v.videoWidth){const sc=Math.min(1,640/v.videoWidth),w=Math.round(v.videoWidth*sc),h=Math.round(v.videoHeight*sc);
+            cv.width=w;cv.height=h;cx.drawImage(v,0,0,w,h);const txt=q.decode(cx.getImageData(0,0,w,h).data,w,h);
+            if(txt){const p=parseSyncInput(txt);if(p&&p.join){stop();closeModal();offerJoin(p);return}msg.textContent="That QR code isn't a Cheer & Chores family code."}}}catch(e){}
+          timer=setTimeout(tick,200)};
+        md.getUserMedia({video:{facingMode:"environment"},audio:false}).then(s=>{
+          if(done){s.getTracks().forEach(t=>t.stop());return}
+          stream=s;v.srcObject=s;const pl=v.play&&v.play();if(pl&&pl.catch)pl.catch(()=>{});tick()})
+        .catch(e=>{msg.textContent=camErrText(e)})}})},
   async shareJoin(){
     if(!SY)return;const code=joinCode();
     openModal({html:()=>`<h2>Your family code</h2><p class="muted">On each iPad or phone: open Cheer &amp; Chores from its home-screen icon, tap “Join my family”, and paste this. Only share it with your own family.</p>
@@ -687,7 +769,7 @@ document.addEventListener("change",e=>{const t=e.target,d=t.dataset;if(!(V.scree
 /* refresh when the app comes back to the foreground (new day, new week) */
 document.addEventListener("visibilitychange",()=>{if(!document.hidden){if(!SY)load();if(V.screen==="parent")V.parent=false,V.screen="home";render()}});
 
-load();loadSyncCfg();render();startSync();
+load();loadSyncCfg();render();startSync();handleJoinLink();
 setTimeout(()=>{if(SY&&SYNC.state==="connecting")syncStatus({fromCache:true})},10000);
 if("serviceWorker" in navigator&&location.protocol==="https:")navigator.serviceWorker.register("sw.js").catch(()=>{});
 /* ask the browser to keep our data even when storage is tight */

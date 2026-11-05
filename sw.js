@@ -1,7 +1,7 @@
 /* Cheer & Chores service worker: lets the app open with no internet.
    Bump VERSION whenever index.html changes so iPads pick up the update. */
-const VERSION = "cc-v2";
-const FILES = ["./", "index.html", "manifest.webmanifest", "sync.js", "icon-180.png", "icon-192.png", "icon-512.png"];
+const VERSION = "cc-v3";
+const FILES = ["./", "index.html", "manifest.webmanifest", "sync.js", "qr.js", "icon-180.png", "icon-192.png", "icon-512.png"];
 self.addEventListener("install", e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener("activate", e => {
   e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== VERSION).map(k => caches.delete(k)))));

@@ -7,6 +7,8 @@ import fs from "fs";
 import assert from "assert";
 import { webcrypto } from "crypto";
 import * as SYNCMOD from "../src/sync.js";
+import * as QRMOD from "../qr.js";
+import { svgToRGBA } from "./qrpix.mjs";
 import { initializeApp } from "firebase/app";
 import { getFirestore, connectFirestoreEmulator, collection, getDocs, doc, getDoc } from "firebase/firestore";
 
@@ -34,17 +36,36 @@ async function until(fn, what, ms = 8000) {
 let n = 0; const ok = m => { n++; console.log("ok", n, m); };
 const errors = [];
 
-function device(name, storage = {}) {
+/* opts: url, ua (user agent), platform + touch (iPadOS desktop mode), standalone (opened from the Home Screen), camera (fake frames) */
+function device(name, storage = {}, opts = {}) {
   const dom = new JSDOM(html, {
-    url: "https://example.test/", runScripts: "dangerously", pretendToBeVisual: true,
+    url: opts.url || "https://example.test/", runScripts: "dangerously", pretendToBeVisual: true,
     beforeParse(w) {
-      w.HTMLCanvasElement.prototype.getContext = () => ({ clearRect() {}, save() {}, translate() {}, rotate() {}, fillRect() {}, restore() {} });
+      w.HTMLCanvasElement.prototype.getContext = () => ({ clearRect() {}, save() {}, translate() {}, rotate() {}, fillRect() {}, restore() {},
+        drawImage() {}, getImageData: (x, y, cw, ch) => (opts.camera && opts.camera.frame) ? opts.camera.frame(cw, ch) : { data: new Uint8ClampedArray(cw * ch * 4) } });
+      if (opts.ua) Object.defineProperty(w.navigator, "userAgent", { get: () => opts.ua });
+      if (opts.platform) Object.defineProperty(w.navigator, "platform", { get: () => opts.platform });
+      if (opts.touch) Object.defineProperty(w.navigator, "maxTouchPoints", { get: () => opts.touch });
+      if (opts.standalone) Object.defineProperty(w.navigator, "standalone", { get: () => true });
+      if (opts.camera) {
+        const cam = opts.camera;
+        Object.defineProperty(w.navigator, "mediaDevices", { value: { getUserMedia: async c => {
+          cam.asked = c; if (cam.deny) throw Object.assign(new Error("denied"), { name: "NotAllowedError" });
+          const track = { stopped: false, stop() { this.stopped = true; } }; cam.track = track; return { getTracks: () => [track] };
+        } } });
+        Object.defineProperty(w.HTMLMediaElement.prototype, "readyState", { get: () => 4 });
+        Object.defineProperty(w.HTMLVideoElement.prototype, "videoWidth", { get: () => 640 });
+        Object.defineProperty(w.HTMLVideoElement.prototype, "videoHeight", { get: () => 480 });
+        w.HTMLMediaElement.prototype.play = () => Promise.resolve();
+        Object.defineProperty(w.HTMLMediaElement.prototype, "srcObject", { set(v) { this._src = v; }, get() { return this._src; } });
+      }
       Object.defineProperty(w, "crypto", { value: webcrypto });
       w.TextEncoder = TextEncoder;
       const ls = { getItem: k => k in storage ? storage[k] : null, setItem: (k, v) => { storage[k] = String(v) }, removeItem: k => { delete storage[k] } };
       Object.defineProperty(w, "localStorage", { value: ls });
       w.scrollTo = () => {};
       w.__ccSyncModule = SYNCMOD;
+      w.__ccQrModule = QRMOD;
       w.__ccSyncOpts = { memory: true, emulator: { host: HOST, port: PORT } };
     }
   });
@@ -90,11 +111,13 @@ await until(() => A.SY() && A.SYNC().ready, "A family created", 15000);
 const fid = A.SY().fid;
 assert(/^[A-Za-z0-9]{32}$/.test(fid), "32-char family id");
 assert.equal(A.SY().cfg.projectId, "demo-cheer"); assert.equal(A.SY().cfg.apiKey, "AIzaFakeKeyForEmulator000000000000000");
+await until(() => A.$("#modal .qrbox svg"), "join QR shown right after setup");
+A.click(A.$("#modal [data-code]"));
 await until(() => A.$("#modal") && A.$("#modal").textContent.includes("Your family code"), "join code shown");
 const code = A.$("#modal textarea").value;
 assert(code.startsWith("CC1."), "join code format");
 A.click(A.$("#modal [data-close]"));
-ok("pasting the Firebase config snippet creates the family and shows a family code");
+ok("pasting the Firebase config snippet creates the family, shows the join QR code, and the family code behind it");
 
 /* check what's on the server directly */
 const admin = getFirestore(initializeApp({ projectId: "demo-cheer", apiKey: "x", appId: "x" }, "checker"));
@@ -240,6 +263,90 @@ await until(() => !C.SY(), "C disconnected");
 const famAfter = await getDoc(doc(admin, "families", fid));
 assert(famAfter.exists()); assert.equal((await getDocs(collection(admin, "families", fid, "kids"))).size, 2);
 ok("disconnecting a device keeps its own copy and doesn't touch the family");
+
+/* ---------- 7b. Join by QR code ---------- */
+await A.parent(); A.click(A.act("ptab", '[data-tab="settings"]'));
+assert(A.act("showJoinQR"), "Show join QR code button on a synced device");
+A.click(A.act("showJoinQR"));
+await until(() => A.$("#modal .qrbox svg"), "QR modal");
+const qrSvg = A.$("#modal .qrbox svg").outerHTML;
+const shown = svgToRGBA(qrSvg, { scale: 5, noise: 20 });
+const qrText = QRMOD.decode(shown.data, shown.width, shown.height);
+const joinLink = A.w.eval("joinUrl()");
+assert.equal(qrText, joinLink, "the QR on screen reads back as the join link");
+assert(qrText.startsWith("https://example.test/#join=CC1."), "family code rides in the # part of the link: " + qrText.slice(0, 40));
+assert.equal(qrText.split("#join=")[1], A.w.eval("joinCode()"));
+A.click(A.$("#modal [data-close]"));
+ok(`the phone shows a scannable QR (${shown.size - 8} modules) holding the app link with the family code after #`);
+
+/* an iPad opens the app from its Home Screen icon and scans with the in-app scanner */
+const cam = { frame: (cw, ch) => svgToRGBA(qrSvg, { scale: 5, noise: 30, frameW: cw, frameH: ch }) };
+const D = device("D-ipad-app", {}, { standalone: true, ua: "Mozilla/5.0 (iPad; CPU OS 18_0 like Mac OS X)", camera: cam });
+D.click(D.act("joinPrompt"));
+assert(D.$("#modal [data-scan]"), "Scan QR code button in Join my family");
+D.click(D.$("#modal [data-scan]"));
+await until(() => D.SY() && D.SY().fid === fid, "D joined by scanning", 15000);
+await until(() => D.$$('[data-act="openKid"]').length === 2, "D shows the kids", 15000);
+assert.deepEqual(cam.asked.video, { facingMode: "environment" }, "asks for the back camera");
+assert(cam.track.stopped, "camera turned off after the scan");
+assert.equal(D.kidByName("Kid A").balance, A.kidByName("Kid A").balance);
+ok("a new iPad taps Join my family > Scan QR code, joins in one step, and the camera turns off");
+await D.parent("4321");
+ok("the parent PIN carries over to the scanned-in iPad");
+
+/* scanning a QR code that isn't ours, then closing the scanner, stops the camera */
+const cam2 = { frame: (cw, ch) => svgToRGBA(QRMOD.svg("https://example.com/menu"), { scale: 5, frameW: cw, frameH: ch }) };
+const E = device("E", {}, { camera: cam2 });
+E.click(E.act("joinPrompt")); E.click(E.$("#modal [data-scan]"));
+await until(() => /isn't a Cheer & Chores family code/.test((E.$("#scanMsg") || {}).textContent || ""), "foreign QR rejected");
+assert(!E.SY() && !cam2.track.stopped);
+E.click(E.$("#modal [data-close]"));
+assert(cam2.track.stopped, "Cancel turns the camera off"); assert(!E.$("#modal"));
+ok("a QR code from somewhere else is ignored, and Cancel turns the camera off");
+
+/* camera blocked, or no camera at all */
+const F = device("F", {}, { camera: { deny: true } });
+F.click(F.act("joinPrompt")); F.click(F.$("#modal [data-scan]"));
+await until(() => /camera is blocked/.test((F.$("#scanMsg") || {}).textContent || ""), "blocked camera message");
+F.click(F.$("#modal [data-paste]")); assert(F.$("#joinCode"), "paste box shown");
+const G = device("G");
+G.click(G.act("joinPrompt")); G.click(G.$("#modal [data-scan]"));
+await until(() => G.$("#joinCode"), "no camera falls back to paste");
+ok("a blocked or missing camera falls back to pasting the family code");
+
+/* the iPad's Camera app opens the link in Safari: explain how to finish in the Home Screen app */
+for (const [label, o] of [["iPad UA", { ua: "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) Safari/604.1" }],
+                          ["iPadOS desktop UA", { ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15", platform: "MacIntel", touch: 5 }]]) {
+  const st = {};
+  const Hs = device("H-safari " + label, st, Object.assign({ url: joinLink }, o));
+  await until(() => Hs.$("#modal") && /Almost there/.test(Hs.$("#modal").textContent), "Almost there in Safari, " + label);
+  assert(!Hs.SY(), "Safari copy doesn't join");
+  assert.equal(Hs.w.location.hash, "", "family code removed from the address bar");
+  assert.equal(JSON.parse(st["cheerchores.pendingJoin"]).code, A.w.eval("joinCode()"), "join saved for the Home Screen copy");
+}
+ok("an iPad Camera scan that opens Safari explains how to finish in the Home Screen app and clears the code from the address bar");
+
+/* if iOS carries Safari's data over when the page is added to the Home Screen, the app offers the join itself */
+const carried = { "cheerchores.pendingJoin": JSON.stringify({ code: A.w.eval("joinCode()"), t: Date.now() }) };
+const H3 = device("H3-ipad-app", carried, { standalone: true, ua: "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X)" });
+await until(() => H3.$("#modal") && /Join your family\?/.test(H3.$("#modal").textContent), "home screen app offers the join");
+assert(!("cheerchores.pendingJoin" in carried), "offer used once");
+H3.click(H3.$("#modal [data-ok]"));
+await until(() => H3.SY() && H3.SY().fid === fid && H3.S().kids.length === 2, "H3 joined", 15000);
+ok("when the Home Screen app starts with that saved join, it offers it and joins on one tap");
+
+/* a phone or computer opening the link joins only after a confirm; an already-joined device just says so */
+const I = device("I-android", {}, { url: joinLink, ua: "Mozilla/5.0 (Linux; Android 14) Chrome/130" });
+await until(() => I.$("#modal") && /Join your family\?/.test(I.$("#modal").textContent), "confirm on link");
+assert(!I.SY(), "nothing joins before the tap");
+I.click(I.$("#modal [data-close]")); assert(!I.SY());
+const J = device("J-same", A.storage, { url: joinLink });
+await until(() => J.$(".toast") && /already in your family/.test(J.$(".toast").textContent), "already joined");
+assert(!J.$("#modal"));
+const K = device("K-bad", {}, { url: "https://example.test/#join=CC1.broken" });
+await until(() => K.$(".toast") && /didn't come through/.test(K.$(".toast").textContent), "bad link");
+assert(!K.SY());
+ok("opening the link elsewhere asks first, an already-joined device just says so, and a damaged link is refused");
 
 /* ---------- 8. Security rules ---------- */
 const anon = getFirestore(initializeApp({ projectId: "demo-cheer", apiKey: "x", appId: "x" }, "stranger"));
